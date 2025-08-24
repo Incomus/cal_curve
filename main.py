@@ -1,52 +1,11 @@
-from cmath import phase
-
 from vna import VNAController
-import time
-import struct
-import socket
-from openpyxl import Workbook, load_workbook
+import struct, traceback, socket, time
+from openpyxl import Workbook#, load_workbook
 from openpyxl.chart import LineChart, Reference
 import numpy as np
 from scipy.signal import savgol_filter
 from scipy.interpolate import interp1d
 import pandas as pd
-
-df = pd.read_excel('test.xlsx')
-phase_smooth = df['PHAS, 14.25GHz']
-volt_list = list(df['voltage, v'])
-phase_smooth[0] = 0
-phase_smooth = savgol_filter(phase_smooth, window_length=5, polyorder=2)
-phase_smooth[0] = 0
-phase_smooth = -abs(phase_smooth)
-
-# Determine target phase range
-phase_span = np.max(phase_smooth) - np.min(phase_smooth)
-if phase_span < 360:
-    # Pad the lowest phase values with 0 until span reaches 360
-    min_phase = np.min(phase_smooth)
-    padding_needed = 361 - phase_span
-    phase_smooth = np.concatenate(
-        [phase_smooth, np.full(int(padding_needed), min_phase - np.arange(1, int(padding_needed) + 1))])
-    volt_list = np.concatenate([volt_list, np.full(int(padding_needed), np.max(volt_list))])
-
-max_voltage_idx = np.argmax(volt_list)
-if phase_span < 360:
-    end_phase = 0
-else:
-    end_phase = int(phase_smooth[max_voltage_idx] + 360)
-
-# New phase points (0 to -360 step -1)
-xq_tx_44 = np.arange(end_phase, end_phase - 361, -1)
-# Interpolation: treating smoothed phase as "x", voltage as "y"
-interp_func = interp1d(phase_smooth, volt_list, kind='linear', bounds_error=False, fill_value=np.nan)
-vq_tx_44 = interp_func(xq_tx_44)
-# Stack phase and voltage
-res_tx_44 = np.column_stack((-xq_tx_44, vq_tx_44))
-# Save to CSV
-pd.DataFrame(res_tx_44, columns=['Phase', 'Voltage']) \
-    .round({'Voltage': 4}) \
-    .to_csv(f'test_cal_curve.csv', index=False, header=False)
-input()
 
 def set_antenna_uniform_volt(voltage, aim_ip):
     message = bytearray([0] * 7)
@@ -106,7 +65,7 @@ def choose(text, *options):
 vna_controller = VNAController(13)
 vna_controller.set_channel('s12')
 ip = '192.168.1.21'
-# -----------------SETUP-----------------
+# -----------------SETUP START-----------------
 
 user_input = choose('Change start and end of measured frequency range?\n'
                     f'Start frequency: {start_fr}GHz, end frequency: {end_fr}GHz', 'y','n')
@@ -226,162 +185,167 @@ if user_input == 'y':
         break
 
 file_name = input('Input excel file name\n')
-#-----------------SETUP-----------------
+#-----------------SETUP END-----------------
 
-
-wb = Workbook()
-ws = wb['Sheet']
-ws.cell(row=1, column=1, value="Frequencies")
-i = 2
-for freq in frequencies:
-    ws.cell(row=i, column=1, value=freq)
-    i += 1
-
-ws.cell(row=1, column=2, value="Measured values")
-i = 2
-for meas_type in types:
-    ws.cell(row=i, column=2, value=meas_type)
-    i += 1
-
-ws.cell(row=1, column=3, value="Max voltage")
-ws.cell(row=2, column=3, value=volt_max)
-ws.cell(row=1, column=4, value="Voltage interval")
-ws.cell(row=2, column=4, value=volt_int)
-
-wb.save(f'{file_name}.xlsx')
-meas_state = False
-
-col_i = 6
-for meas_type in types:
-    print(f'Started measurement of {meas_type}')
-    if meas_type == 'phase':
-        meas_type = 'PHAS'
-    else:
-        meas_type = 'LOGM'
-    vna_controller.set_ampl_or_phase(meas_type)
-    vna_controller.set_frequency(start_fr, end_fr, 'GHz')
-    ws.cell(row=1, column=5, value="voltage, v")
-    for n, freq in enumerate(frequencies):
-        ws.cell(row=1, column=col_i+n, value=f'{meas_type}, {freq}GHz')
-        n += 1
-        vna_controller.put_marker(n, freq)
-
-    prev_value_dict = {}
-    value_dict = {}
-    offset = 0
+try:
+    wb = Workbook()
+    # wb = load_workbook(f'{file_name}.xlsx')
+    ws = wb['Sheet']
+    ws.cell(row=1, column=1, value="Frequencies")
     i = 2
-    state = False
-    for voltage in np.arange(0, volt_max + volt_int, volt_int):
-        voltage = round(voltage, 4)
-        print(f'At voltage {voltage}')
-        if ws.cell(row=i, column=5).value is None:
-            ws.cell(row=i, column=5, value=voltage)
-        elif ws.cell(row=i, column=5).value != voltage:
-            print(f"Mismatch of voltage, was {ws.cell(row=i, column=5).value}, now {voltage}")
-        elif ws.cell(row=i, column=5).value == voltage:
-            pass
-        else:
-            print(f'Weird voltage, was {ws.cell(row=i, column=5).value}, now {voltage}, rewriting.')
-            ws.cell(row=i, column=5, value=voltage)
-        if voltage == 0:
-            set_antenna_uniform_volt(voltage, ip)
-            time.sleep(zero_delay)
-            if meas_type == 'PHAS':
-                vna_controller.set_data_to_memory()
-                time.sleep(5)
-        else:
-            set_antenna_uniform_volt(voltage, ip)
-            time.sleep(main_delay)
-
-        for n, freq in enumerate(frequencies):
-            prev_value_dict[n] = value_dict.get(n, None)
-            n_mark = n + 1
-            value_dict[n] = vna_controller.get_mark_value(n_mark)
-            if prev_value_dict.get(n, None) is None:
-                state = True
-                prev_value_dict[n] = value_dict[n]
-            if meas_type == 'PHAS':
-                value_dict[n] += offset
-                if state:
-                    prev_value_dict[n] += offset
-                    state = False
-                if value_dict[n] - prev_value_dict[n] > 200:
-                    offset += -360
-                    value_dict[n] += -360
-                elif value_dict[n] - prev_value_dict[n] < -200:
-                    offset += 360
-                    value_dict[n] += 360
-            print(f'Frequency: {freq}, {meas_type}: {value_dict[n]}')
-
-            ws.cell(row=i, column=col_i+n, value=value_dict[n])
+    for freq in frequencies:
+        ws.cell(row=i, column=1, value=freq)
         i += 1
-        wb.save(f'{file_name}.xlsx')
-        volt_list.append(voltage)
-    # Create a chart
-    chart = LineChart()
-    chart.title = f"{meas_type} vs Voltage"
-    chart.x_axis.title = "Voltage"
-    chart.y_axis.title = meas_type
 
-    # Define data range (excluding header)
-    categories = Reference(ws, min_col=5, min_row=2, max_col=5, max_row=i - 1)  # voltage values
-    for n, freq in enumerate(frequencies):
-        col_n = col_i + n
-        data = Reference(ws, min_col=col_n, min_row=1, max_col=col_n, max_row=i - 1)  # meas_type values
-        chart.add_data(data, titles_from_data=True)
+    ws.cell(row=1, column=2, value="Measured values")
+    i = 2
+    for meas_type in types:
+        ws.cell(row=i, column=2, value=meas_type)
+        i += 1
 
-        if meas_type == 'PHAS':
-            df = pd.read_excel(f'{file_name}.xlsx')
-            phase_smooth = df[f'{meas_type}, {freq}GHz']
-            volt_list = list(df['voltage, v'])
-            # Smooth the phase values (replace window_length/polyorder if needed)
-            phase_smooth.iloc[0] = 0
-            phase_smooth = savgol_filter(phase_smooth, window_length=5, polyorder=2)
-            phase_smooth = -abs(phase_smooth)
-            phase_smooth[0] = 0
+    ws.cell(row=1, column=3, value="Max voltage")
+    ws.cell(row=2, column=3, value=volt_max)
+    ws.cell(row=1, column=4, value="Voltage interval")
+    ws.cell(row=2, column=4, value=volt_int)
 
-            # Determine target phase range
-            phase_span = np.max(phase_smooth) - np.min(phase_smooth)
-            if phase_span < 360:
-                # Pad the lowest phase values with 0 until span reaches 360
-                min_phase = np.min(phase_smooth)
-                padding_needed = 361 - phase_span
-                phase_smooth = np.concatenate(
-                    [phase_smooth, np.full(int(padding_needed), min_phase - np.arange(1, int(padding_needed) + 1))])
-                volt_list = np.concatenate([volt_list, np.full(int(padding_needed), np.max(volt_list))])
-
-            max_voltage_idx = np.argmax(volt_list)
-            if phase_span < 360:
-                end_phase = 0
-            else:
-                end_phase = int(phase_smooth[max_voltage_idx] + 360)
-
-            # New phase points (0 to -360 step -1)
-            xq_tx_44 = np.arange(end_phase, end_phase - 361, -1)
-            # Interpolation: treating smoothed phase as "x", voltage as "y"
-            interp_func = interp1d(phase_smooth, volt_list, kind='linear', bounds_error=False, fill_value=np.nan)
-            vq_tx_44 = interp_func(xq_tx_44)
-            # Stack phase and voltage
-            res_tx_44 = np.column_stack((-xq_tx_44, vq_tx_44))
-            # Save to CSV
-            pd.DataFrame(res_tx_44, columns=['Phase', 'Voltage']) \
-                .round({'Voltage': 4}) \
-                .to_csv(f'{freq}_cal_curve.csv', index=False, header=False)
-
-
-
-    col_i += n + 1
-    chart.varyColors = False
-    chart.set_categories(categories)
-
-    # Position chart below the data (or adjust as needed)
-    if meas_state == True:
-        ws.add_chart(chart, f"Z2")
-    else:
-        ws.add_chart(chart, f"M2")
-    meas_state = True
-
-    # Save workbook with chart
     wb.save(f'{file_name}.xlsx')
+    meas_state = False
 
-set_antenna_uniform_volt(0, ip)
+    col_i = 6
+    for meas_type in types:
+        print(f'Started measurement of {meas_type}')
+        if meas_type == 'phase':
+            meas_type = 'PHAS'
+        else:
+            meas_type = 'LOGM'
+        vna_controller.set_ampl_or_phase(meas_type)
+        vna_controller.set_frequency(start_fr, end_fr, 'GHz')
+        ws.cell(row=1, column=5, value="voltage, v")
+        for n, freq in enumerate(frequencies):
+            ws.cell(row=1, column=col_i+n, value=f'{meas_type}, {freq}GHz')
+            n += 1
+            vna_controller.put_marker(n, freq)
+
+        prev_value_dict = {}
+        value_dict = {}
+        offset = 0
+        i = 2
+        state = False
+        for voltage in np.arange(0, volt_max + volt_int, volt_int):
+            voltage = round(voltage, 4)
+            print(f'At voltage {voltage}')
+            if ws.cell(row=i, column=5).value is None:
+                ws.cell(row=i, column=5, value=voltage)
+            elif ws.cell(row=i, column=5).value != voltage:
+                print(f"Mismatch of voltage, was {ws.cell(row=i, column=5).value}, now {voltage}")
+            elif ws.cell(row=i, column=5).value == voltage:
+                pass
+            else:
+                print(f'Weird voltage, was {ws.cell(row=i, column=5).value}, now {voltage}, rewriting.')
+                ws.cell(row=i, column=5, value=voltage)
+            if voltage == 0:
+                set_antenna_uniform_volt(voltage, ip)
+                time.sleep(zero_delay)
+                if meas_type == 'PHAS':
+                    vna_controller.set_data_to_memory()
+                    time.sleep(5)
+            else:
+                set_antenna_uniform_volt(voltage, ip)
+                time.sleep(main_delay)
+
+            for n, freq in enumerate(frequencies):
+                prev_value_dict[n] = value_dict.get(n, None)
+                n_mark = n + 1
+                value_dict[n] = vna_controller.get_mark_value(n_mark)
+                if prev_value_dict.get(n, None) is None:
+                    state = True
+                    prev_value_dict[n] = value_dict[n]
+                if meas_type == 'PHAS':
+                    value_dict[n] += offset
+                    if state:
+                        prev_value_dict[n] += offset
+                        state = False
+                    if value_dict[n] - prev_value_dict[n] > 200:
+                        offset += -360
+                        value_dict[n] += -360
+                    elif value_dict[n] - prev_value_dict[n] < -200:
+                        offset += 360
+                        value_dict[n] += 360
+                print(f'Frequency: {freq}, {meas_type}: {value_dict[n]}')
+
+                ws.cell(row=i, column=col_i+n, value=value_dict[n])
+            i += 1
+            wb.save(f'{file_name}.xlsx')
+        # Create a chart
+        chart = LineChart()
+        chart.title = f"{meas_type} vs Voltage"
+        chart.x_axis.title = "Voltage"
+        chart.y_axis.title = meas_type
+
+        # Define data range (excluding header)
+        categories = Reference(ws, min_col=5, min_row=2, max_col=5, max_row=i - 1)  # voltage values
+        for n, freq in enumerate(frequencies):
+            col_n = col_i + n
+            data = Reference(ws, min_col=col_n, min_row=1, max_col=col_n, max_row=i - 1)  # meas_type values
+            chart.add_data(data, titles_from_data=True)
+
+            if meas_type == 'PHAS':
+                df = pd.read_excel(f'{file_name}.xlsx')
+                phase_smooth = df[f'{meas_type}, {freq}GHz']
+                volt_list = list(df['voltage, v'])
+                # Smooth the phase values (replace window_length/polyorder if needed)
+                phase_smooth.iloc[0] = 0
+                phase_smooth = savgol_filter(phase_smooth, window_length=5, polyorder=2)
+                phase_smooth = -abs(phase_smooth)
+                phase_smooth[0] = 0
+
+                # Determine target phase range
+                phase_span = np.max(phase_smooth) - np.min(phase_smooth)
+                if phase_span < 360:
+                    # Pad the lowest phase values with 0 until span reaches 360
+                    min_phase = np.min(phase_smooth)
+                    padding_needed = 361 - phase_span
+                    phase_smooth = np.concatenate(
+                        [phase_smooth, np.full(int(padding_needed), min_phase - np.arange(1, int(padding_needed) + 1))])
+                    volt_list = np.concatenate([volt_list, np.full(int(padding_needed), np.max(volt_list))])
+
+                max_voltage_idx = np.argmax(volt_list)
+                if phase_span < 360:
+                    end_phase = 0
+                else:
+                    end_phase = int(phase_smooth[max_voltage_idx] + 360)
+
+                # New phase points (0 to -360 step -1)
+                xq_tx_44 = np.arange(end_phase, end_phase - 361, -1)
+                # Interpolation: treating smoothed phase as "x", voltage as "y"
+                interp_func = interp1d(phase_smooth, volt_list, kind='linear', bounds_error=False, fill_value=np.nan)
+                vq_tx_44 = interp_func(xq_tx_44)
+                # Stack phase and voltage
+                xq_tx_44 -= np.max(xq_tx_44)
+                res_tx_44 = np.column_stack((-xq_tx_44, vq_tx_44))
+                # Save to CSV
+                pd.DataFrame(res_tx_44, columns=['Phase', 'Voltage']) \
+                    .round({'Voltage': 4}) \
+                    .to_csv(f'{freq}_cal_curve.csv', index=False, header=False)
+
+
+
+        col_i += n + 1
+        chart.varyColors = False
+        chart.set_categories(categories)
+
+        # Position chart below the data (or adjust as needed)
+        if meas_state == True:
+            ws.add_chart(chart, f"Z2")
+        else:
+            ws.add_chart(chart, f"M2")
+        meas_state = True
+
+        # Save workbook with chart
+        wb.save(f'{file_name}.xlsx')
+except Exception as e:
+    print(f"Error: {e}\nType: {type(e).__name__}\n")
+    traceback.print_exc()
+
+# set_antenna_uniform_volt(0, ip)
+input("Press Enter to exit\n")
